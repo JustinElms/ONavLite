@@ -1,71 +1,124 @@
+import os
+import shutil
 import sys
-import datetime
-import logging
-import ctypes
-ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("myappid")
 
-from PySide2.QtWidgets import QApplication, QComboBox, QMainWindow, QHBoxLayout, QVBoxLayout, QWidget, QFrame, QLabel, QPushButton, QTableWidget, QTabWidget, QTextBrowser
-from PySide2.QtCore import Qt, QSize, Signal, QObject, Signal
+import requests
+
+try:
+    from PySide2.QtWinExtras import QtWin
+    myappid = 'DFO.ONavLite.0.0'
+    QtWin.setCurrentProcessExplicitAppUserModelID(myappid)
+except ImportError:
+    pass
+
+import json
+from contextlib import closing
+from urllib.error import HTTPError
+from urllib.parse import urlencode
+from urllib.request import urlopen
+
+from PIL import Image
+from PySide2.QtCore import Qt
 from PySide2.QtGui import QIcon
+from PySide2.QtWidgets import (QApplication, QComboBox, QFrame, QHBoxLayout,
+                               QLabel, QMainWindow, QPushButton, QTableWidget,
+                               QTabWidget, QTextEdit, QVBoxLayout, QWidget)
 
-from api_scripts import profile_script, vm_script, area_script, timestamps_script
 
-logger = logging.getLogger(__name__)
+class apiCalls():
 
-class XStream(QObject):
-    _stdout = None
-    _stderr = None
+    def __init__(self, console=None):
+        self.console = console
+        self.dpi = 144
+        self.location = os.getcwd()
+        self.base_plot_url = 'http://navigator.oceansdata.ca/api/v1.0/plot/?'
 
-    messageWritten = Signal(str)
+    def timestamps(query): 
+        url = f"http://navigator.oceansdata.ca/api/v1.0/timestamps/?dataset={query['dataset']}&variable={query['variable']}"
 
-    def flush( self ):
-        pass
+        data_file = requests.get(url, timeout=30)
 
-    def fileno( self ):
-        return -1
+        if data_file.status_code == 200:
+            data = data_file.json()
+            return {d['value'].replace('T', ' ').replace('+00:00', ' ') : d['id'] for d in data}
 
-    def write( self, msg ):
-        if ( not self.signalsBlocked() ):
-            self.messageWritten.emit(msg)
+    def depths(query):
+        url = f"http://navigator.oceansdata.ca/api/v1.0/depth/?dataset={query['dataset']}&variable={query['variable']}"
 
-    @staticmethod
-    def stdout():
-        if ( not XStream._stdout ):
-            XStream._stdout = XStream()
-            sys.stdout = XStream._stdout
-        return XStream._stdout
+        data_file = requests.get(url, timeout=30)
 
-class onav_lite(QMainWindow):
+        if data_file.status_code == 200:
+            data = data_file.json()
+            if data:
+                depths = {d['value'] : d['id'] for d in data}
+                depths['Bottom'] = depths.pop('Bottom')
+                return depths
+            else:
+                return {'0 m' : 0}
+
+    def csv(self, query, fileName):
+        url = self.base_plot_url + urlencode({'query': json.dumps(query)}) + '&save&format=csv&size=10x7&dpi=' + str(self.dpi)
+        self.console.append(url)
+
+        data_file = requests.get(url, stream=True, timeout=30)
+        if data_file.status_code == 200:
+            data = data_file.raw
+
+            # Save file and finish
+            with open(fileName + '.csv', 'wb') as self.location:
+                self.console.append('Saving as ' + fileName + '.csv')
+                shutil.copyfileobj(data, self.location)
+                self.console.append('Done')
+        else:
+            self.console.append('Could not complete request.')
+    
+    def png(self, query, fileName):
+        # Assemble full request
+        url = self.base_plot_url + urlencode({'query': json.dumps(query)}) + '&dpi=' + str(self.dpi)
+        self.console.append(url)
+
+        # Save file and finish
+        try:
+            with closing(urlopen(url, timeout=30)) as f:
+                self.console.append('Saving as ' + fileName + '.png')
+                img = Image.open(f)
+                self.console.append('Done')
+                img.save(fileName + '.png', 'PNG')
+        except HTTPError:
+            self.console.append('Could not complete request.')
+
+class Onav_lite(QMainWindow):
 
     def __init__(self, parent=None):
-        super(onav_lite, self).__init__(parent)
+        super(Onav_lite, self).__init__(parent)
         self.setWindowTitle("Ocean Navigator Lite")
 
+        # initialize dictionaries and variables for data
         self.datasetDict = { '01. GIOPS 10 day Forecast 3D - LatLon' : 'giops_day',
                             '05. CCG RIOPS Forecast Surface - LatLon' : 'riops_fc_2dll',
                             '06. RIOPS Forecast 3D - Polar Stereographic' : 'riops_fc_3dps'
                         }
 
         self.variableDict = {}
-
         self.timestampDict = []
-
+        self.depthDict = {}
         self.quantum = []
 
         # initialize app widgets
         self.initUI()
-        #self.setFixedSize(640,410)
+
+        self.apiCalls = apiCalls(self.outputConsole)
+
+        # set window size and background color
         self.setFixedSize(640,460)
         self.setStyleSheet('Background-Color: #ffffff')
-
         self.setWindowIcon(QIcon('onavlite.ico'))
 
-        XStream.stdout().messageWritten.connect(self.consoleOutput.insertPlainText)
-
         # display app
-        self.show()        
+        self.show() 
 
     def initUI(self):
+
         main = QWidget(self)
         mainLayout = QVBoxLayout(main)
         self.setCentralWidget(main)
@@ -100,8 +153,8 @@ class onav_lite(QMainWindow):
         self.datasetCB = QComboBox(dataPanel)
         self.variableCB = QComboBox(dataPanel)
         self.datasetCB.addItems(self.datasetDict.keys())
-        self.datasetCB.currentIndexChanged.connect(self.changeDataset)
         self.variableCB.addItems(self.variableDict.keys())
+        self.datasetCB.currentIndexChanged.connect(self.datasetChanged)
 
         dataPanelLayout.addWidget(dataHeader)
         dataPanelLayout.addWidget(self.datasetCB)
@@ -114,7 +167,7 @@ class onav_lite(QMainWindow):
 
         locationButtons = QWidget(locationPanel)
         locationButtonsLayout = QHBoxLayout(locationButtons)
-        rowLabel = QLabel('Point Quanitity', locationButtons)
+        rowLabel = QLabel('Point Quantity', locationButtons)
         addRowButton = QPushButton('+', locationButtons)
         addRowButton.setStyleSheet('background-color: #008cba; color : #ffffff;')
         addRowButton.setFixedSize(20,20)
@@ -146,7 +199,7 @@ class onav_lite(QMainWindow):
 
         profileWidget = QWidget()
         profileWidgetLayout = QVBoxLayout(profileWidget)
-        profileStartTimeLabel = QLabel('Start Time', profileWidget)
+        profileStartTimeLabel = QLabel('Time', profileWidget)
         self.profileStartTimeCB = QComboBox(profileWidget)
 
         profileWidgetLayout.addWidget(profileStartTimeLabel)
@@ -159,21 +212,15 @@ class onav_lite(QMainWindow):
         vmEndTimeLabel = QLabel('End Time', vmWidget)
         self.vmStartTimeCB = QComboBox(vmWidget)
         self.vmEndTimeCB = QComboBox(vmWidget)
+        vmDepthLabel = QLabel('Depth', vmWidget)
+        self.vmDepthCB = QComboBox(vmWidget)
 
         vmWidgetlayout.addWidget(vmStartTimeLabel)
         vmWidgetlayout.addWidget(self.vmStartTimeCB)
         vmWidgetlayout.addWidget(vmEndTimeLabel)
         vmWidgetlayout.addWidget(self.vmEndTimeCB)
-
-        # lineWidget = QWidget()
-        # lineWidgetLayout = QVBoxLayout(lineWidget)
-        # lineCBLabel = QLabel('Data Type', lineWidget)
-        # lineCB = QComboBox(lineWidget)
-        # lineCB.addItems(['Transect', 'Hovmoller'])
-
-        # lineWidgetLayout.addWidget(lineCBLabel)
-        # lineWidgetLayout.addWidget(lineCB)
-        # lineWidgetLayout.addStretch()
+        vmWidgetlayout.addWidget(vmDepthLabel)
+        vmWidgetlayout.addWidget(self.vmDepthCB)
 
         areaWidget = QWidget()
         areaWidgetLayout = QVBoxLayout(areaWidget)
@@ -183,14 +230,14 @@ class onav_lite(QMainWindow):
         self.areaStartTimeCB = QComboBox(areaWidget)
         self.arrowsCB = QComboBox(areaWidget)
         self.arrowsCB.addItems(['None', 'Water Velocity'])
-        self.addContCB = QComboBox(areaWidget)
+        self.addContourCB = QComboBox(areaWidget)
 
         areaWidgetLayout.addWidget(areaStartTimeLabel)
         areaWidgetLayout.addWidget(self.areaStartTimeCB)
         areaWidgetLayout.addWidget(arrowsLabel)
         areaWidgetLayout.addWidget(self.arrowsCB)
         areaWidgetLayout.addWidget(addContLabel)
-        areaWidgetLayout.addWidget(self.addContCB)
+        areaWidgetLayout.addWidget(self.addContourCB)
 
         plotOptionsHeader = QLabel('API Options', optionsLFrame)
         plotOptionsHeader.setFixedWidth(270)
@@ -215,12 +262,8 @@ class onav_lite(QMainWindow):
         self.outputCB.addItems(['CSV', 'PNG'])
         self.outputCB.setFixedWidth(50)
 
-        # outputLayout.addWidget(outputLabel)
-        # outputLayout.addWidget(self.outputCB)
-        # outputLayout.addStretch()
-
-        self.consoleOutput = QTextBrowser(bottomFrame)
-        #self.consoleOutput.textChanged().connect(self.scrollToBottom())
+        self.outputConsole = QTextEdit(bottomFrame)
+        self.outputConsole.setReadOnly(True)
 
         submitButton = QPushButton(buttonFrame)
         submitButton.setText('Submit')
@@ -229,9 +272,7 @@ class onav_lite(QMainWindow):
 
         buttonFrameLayout.addWidget(outputLabel)
         buttonFrameLayout.addWidget(self.outputCB)
-        #buttonFrameLayout.addStretch()
         buttonFrameLayout.addWidget(submitButton)
-        #buttonFrameLayout.addStretch()
 
         optionsLLayout.addWidget(dataPanel)
         optionsLLayout.addWidget(plotOptionsHeader)
@@ -239,32 +280,31 @@ class onav_lite(QMainWindow):
         optionsLLayout.addStretch()
         optionsRLayout.addWidget(locationPanel)
         optionsRLayout.addStretch()
-        bottomLayout.addWidget(self.consoleOutput)
+        bottomLayout.addWidget(self.outputConsole)
         bottomLayout.addWidget(buttonFrame)
 
-        self.changeDataset()
-
+        self.datasetChanged()
+    
     def addRows(self):
+        # adds an additional row to the coordinates table
         self.latlonTable.setRowCount(self.latlonTable.rowCount() + 1)
 
     def removeRows(self):
+        # removes the last row from the coordinates table
         if self.latlonTable.rowCount() > 1:
             self.latlonTable.setRowCount(self.latlonTable.rowCount() - 1)
 
     def optChanged(self):
+        # change the number of rows in the coordinates table based on which tab is selected
         if self.plotOptions.currentIndex() == 0 or self.plotOptions.currentIndex() == 1:
             self.latlonTable.setRowCount(1)
         elif self.plotOptions.currentIndex() == 2:
             self.latlonTable.setRowCount(4)
 
-    def changeDataset(self):
+    def datasetChanged(self):
 
         if self.datasetCB.currentText() == '01. GIOPS 10 day Forecast 3D - LatLon':
             self.quantum = 'day'
-
-            timeFactor = datetime.datetime.strptime('1950-01-01 00:00:00', '%Y-%m-%d  %H:%M:%S')
-            starttime = datetime.datetime.today().replace(hour=0, minute=0, second=0, microsecond=0)
-            times = [starttime + datetime.timedelta(hours=x) for x in range(12,216,24)]
 
             self.variableDict = {"Temperature" : "votemper",
                                 "Salinity" : "vosaline",
@@ -278,9 +318,6 @@ class onav_lite(QMainWindow):
 
         elif self.datasetCB.currentText() == '05. CCG RIOPS Forecast Surface - LatLon' :
             self.quantum = 'hour'
-            timeFactor = datetime.datetime.strptime('1950-01-01 00:00:00', '%Y-%m-%d  %H:%M:%S')
-            starttime = datetime.datetime.today().replace(hour=0, minute=0, second=0, microsecond=0) - datetime.timedelta(hours=1)
-            times = [starttime + datetime.timedelta(hours=x) for x in range(44)]
 
             self.variableDict = {"Temperature" : "votemper",
                                 "Salinity" : "vosaline",
@@ -289,9 +326,7 @@ class onav_lite(QMainWindow):
                                 }
 
         elif self.datasetCB.currentText() == '06. RIOPS Forecast 3D - Polar Stereographic' :
-            timeFactor = datetime.datetime.strptime('1950-01-01 00:00:00', '%Y-%m-%d  %H:%M:%S')
-            starttime = datetime.datetime.today().replace(hour=0, minute=0, second=0, microsecond=0) - datetime.timedelta(days=6)
-            times = [starttime + datetime.timedelta(hours=x) for x in range(24)]
+            self.quantum = 'hour'
 
             self.variableDict = {"Temperature" : "votemper",
                                 "Salinity" : "vosaline",
@@ -305,9 +340,12 @@ class onav_lite(QMainWindow):
 
         self.variableCB.addItems(self.variableDict.keys())
 
-        timestrings = [dt.strftime("%Y-%m-%d %H:%M:%S") for dt in times]
-        timestamps = [int((ts - timeFactor).total_seconds()) for ts in times]
-        self.timestampDict = dict(zip(timestrings, timestamps))
+        query = {'dataset' : self.datasetDict[self.datasetCB.currentText()],
+                    'variable' : self.variableDict[self.variableCB.currentText()]}
+
+        self.timestampDict = apiCalls.timestamps(query)
+
+        self.depthDict = apiCalls.depths(query)
 
         self.profileStartTimeCB.clear()
         self.profileStartTimeCB.addItems(self.timestampDict.keys())
@@ -318,17 +356,14 @@ class onav_lite(QMainWindow):
         self.vmEndTimeCB.clear()
         self.vmEndTimeCB.addItems(self.timestampDict.keys())
         self.vmEndTimeCB.setCurrentIndex(len(self.timestampDict.keys())-1)
+        self.vmDepthCB.clear()
+        self.vmDepthCB.addItems(self.depthDict.keys())
         self.areaStartTimeCB.clear()
         self.areaStartTimeCB.addItems(self.timestampDict.keys())
         self.areaStartTimeCB.setCurrentIndex(0)
-        self.addContCB.clear()
-        self.addContCB.addItem('None')
-        self.addContCB.addItems(self.variableDict.keys())
-
-        query ={'dataset' : self.datasetDict['01. GIOPS 10 day Forecast 3D - LatLon'],
-                    'variable' : self.variableDict[self.variableCB.currentText()]}
-
-        ts = timestamps_script.requestFile(query)
+        self.addContourCB.clear()
+        self.addContourCB.addItem('None')
+        self.addContourCB.addItems(self.variableDict.keys())
 
     def getLatLon(self):
 
@@ -338,51 +373,66 @@ class onav_lite(QMainWindow):
             try:
                 points.append([float(self.latlonTable.item(i,0).text()),
                             float(self.latlonTable.item(i,1).text())])
-            except:
+            except AttributeError:
                 pass
+            except ValueError:
+                points = []
+                self.outputConsole.append('Coordinate format error.')
 
         return points
 
     def makeAPICall(self):
-        print('Making query...')
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        self.outputConsole.append('Making query...')
         points = self.getLatLon()
+        query = {}
+        fileName = ''
 
         if self.plotOptions.currentIndex() == 0:
-            if len(points) > 1:
-                points = points[0]
-            query = {"dataset":self.datasetDict[self.datasetCB.currentText()],
-                    "names":[],
-                    "plotTitle":"",
-                    "quantum":self.quantum,
-                    "showmap":0,
-                    "station":points,
-                    "time":self.timestampDict[self.profileStartTimeCB.currentText()],
-                    "type":"profile",
-                    "variable":[self.variableDict[self.variableCB.currentText()]]}
+            for p in points:
+                fileName = '_'.join(['Profile',
+                                    self.datasetDict[self.datasetCB.currentText()],
+                                    self.variableDict[self.variableCB.currentText()],
+                                    str(self.timestampDict[self.profileStartTimeCB.currentText()]),
+                                    str(p),
+                                    ])
 
-            profile_script.requestFile(query, self.outputCB.currentText())
+                query = {"dataset":self.datasetDict[self.datasetCB.currentText()],
+                        "names":[],
+                        "plotTitle":"",
+                        "quantum":self.quantum,
+                        "showmap":0,
+                        "station":[p],
+                        "time":self.timestampDict[self.profileStartTimeCB.currentText()],
+                        "type":"profile",
+                        "variable":[self.variableDict[self.variableCB.currentText()]]}
 
         elif self.plotOptions.currentIndex() == 1:
 
-            if len(points) > 1:
-                points = points[0]
+            for p in points:
+                
+                fileName = '_'.join(['Virtual_Mooring',
+                                    self.datasetDict[self.datasetCB.currentText()],
+                                    self.variableDict[self.variableCB.currentText()],
+                                    str(self.timestampDict[self.vmStartTimeCB.currentText()]),
+                                    str(self.timestampDict[self.vmEndTimeCB.currentText()]),
+                                    str(p),
+                                    ])
 
-            query = {"colormap":"default",
-                    "dataset":self.datasetDict[self.datasetCB.currentText()],
-                    "depth":0,
-                    "endtime":self.timestampDict[self.vmEndTimeCB.currentText()],
-                    "names":[],
-                    "plotTitle":"",
-                    "quantum":self.quantum,
-                    "scale":"-5,30,auto",
-                    "showmap":0,
-                    "starttime":self.timestampDict[self.vmStartTimeCB.currentText()],
-                    "station":points,
-                    "type":"timeseries",
-                    "variable":self.variableDict[self.variableCB.currentText()]
-                }
-
-            vm_script.requestFile(query, self.outputCB.currentText())
+                query = {"colormap":"default",
+                        "dataset":self.datasetDict[self.datasetCB.currentText()],
+                        "depth":0,
+                        "endtime":self.timestampDict[self.vmEndTimeCB.currentText()],
+                        "names":[],
+                        "plotTitle":"",
+                        "quantum":self.quantum,
+                        "scale":"-5,30,auto",
+                        "showmap":0,
+                        "starttime":self.timestampDict[self.vmStartTimeCB.currentText()],
+                        "station":[p],
+                        "type":"timeseries",
+                        "variable":self.variableDict[self.variableCB.currentText()]
+                    }
 
         elif self.plotOptions.currentIndex() == 2:
 
@@ -391,10 +441,16 @@ class onav_lite(QMainWindow):
             else:
                 arrowVar = self.variableDict[self.arrowsCB.currentText()]
 
-            if self.addContCB.currentText() == 'None':
-                contVar = 'none'
+            if self.addContourCB.currentText() == 'None':
+                contoutVar = 'none'
             else:
-                contVar = self.variableDict[self.addContCB.currentText()]
+                contoutVar = self.variableDict[self.addContourCB.currentText()]
+
+            fileName = '_'.join(['Area',
+                                    self.datasetDict[self.datasetCB.currentText()],
+                                    self.variableDict[self.variableCB.currentText()],
+                                    str(self.timestampDict[self.vmStartTimeCB.currentText()]),
+                                    ])
 
             if len(points) >= 3:
                 query = {"area":[{"innerrings":[],
@@ -406,7 +462,7 @@ class onav_lite(QMainWindow):
                         "hatch":0,
                         "legend":1,
                         "levels":"auto",
-                        "variable":contVar},
+                        "variable":contoutVar},
                         "dataset":self.datasetDict[self.datasetCB.currentText()],
                         "depth":0,
                         "interp":"gaussian",
@@ -424,14 +480,18 @@ class onav_lite(QMainWindow):
                         "variable":self.variableDict[self.variableCB.currentText()]
                     }
 
-                area_script.requestFile(query, self.outputCB.currentText())
+        if self.outputCB.currentText() == 'CSV':
+            self.apiCalls.csv(query, fileName)
+        elif self.outputCB.currentText() == 'PNG':
+            self.apiCalls.png(query, fileName)
+
+        QApplication.restoreOverrideCursor()
 
 if __name__ == '__main__':
     # Create the Qt Application
     app = QApplication(sys.argv)
     # Create and show the form
-    #tray = QSystemTrayIcon(QIcon("icons/256x256.png"), app)
-    onav = onav_lite()
+    onav = Onav_lite()
     onav.show()
     # Run the main Qt loop
     sys.exit(app.exec_())
